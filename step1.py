@@ -237,3 +237,83 @@ plt.imshow(final[15], cmap='gray')
 plt.title('Patch[15] from final group (after reverse 3D)')
 plt.show()
 
+#%%
+'''
+here is python code that does this:
+1) Compute 8x8 matrices that, when applied to a vector result in a 1d Bior1.5 
+    trasnform
+2) A function that applies bior1.5 and inverse bior1.5 to any dimension of a 
+    tensor
+3) A test section that demonstrates that.
+
+To be clear the function get_Bior_matrices is called only once to 
+prepare your program. The function apply_bior is called whenever needed. 
+An example of 2D transform is also given.
+'''
+import numpy as np
+import pywt
+
+def get_Bior_matrices(N=8):
+    directBior15_matrix=np.zeros((N,N))
+    ss=N//2
+    ls=[]
+
+    while ss>0:
+        ls=ls+[ss]
+        ss=ss//2
+    print (ls)   
+    for k in range(N):
+        inp=np.zeros(N)
+        inp[k]=1
+        tmp=inp
+        out=[]
+        for s in ls:
+            #print (out,s)
+            (a,b)=pywt.dwt(tmp,'bior1.5',mode='periodic')
+            out=list(b[0:s])+out
+            tmp=a[:s]
+            #print ('sortie s=',s)
+        out=list(a[:s])+out
+        directBior15_matrix[k,:]=np.asarray(out)
+
+    invBior15_matrix=np.linalg.inv(directBior15_matrix)
+    return directBior15_matrix,invBior15_matrix
+
+def apply_bior(V,M,dim):
+    s=V.shape
+    l=[0,1,2]
+    l[dim]=0
+    l[0]=dim
+    smod=list(s)
+    smod[dim]=s[0]
+    smod[0]=s[dim]
+    return (M@V.transpose(l).reshape(((M.shape[0]),-1))).reshape(smod).transpose(l)
+
+
+#%% TEST
+# The next line is done ONLY ONCE IN THE PROGRAM
+B8,IB8=get_Bior_matrices(N=8)
+
+v=np.random.randn(8,8,10)
+
+vapp=apply_bior(v,B8,1) #Apply direct bior to dimension 1
+
+print (vapp[6,:,7]-B8@v[6,:,7]) #check if the desired transform occured
+
+#check for inverse
+
+vappinv=apply_bior(vapp,IB8,1) # apply inverse bior to dimension 1
+print (((vappinv-v)**2).sum())
+
+# 2D bior transorf on dimensions 0 and 1. v is supposed size 8x8xN
+v1d=apply_bior(v,B8,1)
+v2d=apply_bior(v1d,B8,0) #see how
+#%%
+tmp=[0,0,1, 0,0,0,0,0]
+ls=[4,2,1]
+out=[]
+for s in ls:
+    #print (out,s)
+    (a,b)=pywt.dwt(tmp,'bior1.5',mode='periodic')
+    out=list(b[0:s])+out
+    tmp=a[:s]
