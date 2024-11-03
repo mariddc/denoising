@@ -1,10 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Oct 17 22:13:45 2024
-
-@author: maria
-"""
-#%% 
+#%% MODULES
 import numpy as np
 from skimage import io as skio
 import heapq
@@ -12,308 +6,347 @@ import pywt
 import math
 from scipy.linalg import hadamard
 import cv2
-
-# local
 import matplotlib.pyplot as plt
+
 #%% PARAMETERS
+# Define parameters for the first step of the BM3D algorithm
+
 # 1st step
-kHard = 8 #patch size
-nHard = 39 #search window size --! era pra ser 39 mas nao entendi como centralizar P
-NHard = 16 #max number of similar patches kept 
+kHard = 8  # Patch size
+nHard = 39 # Search window size
+NHard = 16 # Max number of similar patches kept
 pHard = 3
 
 sigma = 30
 tauHard = 5000 if sigma > 40 else 2500
 
-lambdaHard2d = 0 #hard thresholding for grouping --! ??? where
+lambdaHard2d = 0  # Thresholding parameter for grouping
 lambdaHard3d = 2.7
 
-#%% INITIALIZATION
-def noise(im,br):
-    """ Cette fonction ajoute un bruit blanc gaussier d'ecart type br
-       a l'image im et renvoie le resultat"""
-    imt=np.float32(im.copy())
-    sh=imt.shape
-    bruit=br*np.random.randn(*sh)
-    imt=imt+bruit
-    return imt
-
-
-#%% GROUPING
-def closest_power_of_two(n, max_n):
-    """Find the closest power of 2 to the number n, but not exceeding max_n."""
-    if n == 0:
-        return 0
-    closest_pow2 = 2 ** (math.floor(math.log2(n)))
-    return min(closest_pow2, max_n)
-
-
-def distance(p,q):
-    return (np.linalg.norm(p-q) ** 2) / (kHard ** 2)
+#%% GROUPING 1ST STEP
+def get_search_window(image, x, y, patch_size=kHard, window_size=nHard):
+    """ Gets the search window centered around the reference patch.
+    
+    Parameters:
+    - image (np.ndarray): input image
+    - x, y (int): coordinates of the top-left corner of the reference patch
+    - patch_size (int): size of the patch
+    - window_size (int): size of the search window
+    
+    Returns:
+    - search_window (np.ndarray): search window around the reference patch
+    - window_top_left_x, window_top_left_y (int): coordinates of the top-left corner of the search window
+    """
+    window_top_left_x = x - (window_size // 2 - patch_size // 2)
+    window_top_left_y = y - (window_size // 2 - patch_size // 2)
+    
+    search_window = image[
+        window_top_left_x: window_top_left_x + window_size,
+        window_top_left_y: window_top_left_y + window_size 
+    ]
+    return search_window, window_top_left_x, window_top_left_y
 
 def hard_thresholding(img, threshold):
-    return (abs(img) <= threshold) * img
-
-# x,y is the top-left corner of the reference patch
-# doesnt work well for even window_size --change
-def get_search_window(image, x, y, patch_size=kHard, window_size=nHard):
-    img_h, img_w = image.shape  # image dimensions
+    """ Applies hard thresholding to an array, setting values below the threshold to zero.
     
-    # padded image (to handle borders)
-    padded_image = np.pad(image, window_size//2, mode='reflect')
+    Parameters:
+    - img (np.ndarray): input array
+    - threshold (float): threshold value
     
-    # adjust coordinates
-    x_padded = x + window_size//2
-    y_padded = y + window_size//2
+    Returns:
+    - np.ndarray: thresholded array with values below the threshold set to zero
+    """
+    return (abs(img) > threshold) * img
 
-    # ensure the patch defined by (x, y) fits within the image bounds
-    if x < 0 or y < 0 or x + patch_size > img_w or y + patch_size > img_h:
-        raise ValueError("The specified patch defined by (x, y) exceeds image boundaries.")
+def grouping_1st_step(x, y, image, sigma, patch_size, window_size, lambdaHard2d, tauHard, N=NHard):
+    """ Groups similar patches around a reference patch within a search window.
     
-    search_window = padded_image[
-        y_padded - (window_size//2 - patch_size//2):y_padded + window_size//2 + patch_size//2 +1,
-        x_padded - (window_size//2 - patch_size//2):x_padded + window_size//2 + patch_size//2 +1  
-    ]
-    return search_window
-
-
-def build_3d_group(p, window, sigma, lambdaHard2d, tauHard, N=NHard):
-    closer_N_dists = []
-
-    # assumming square patch and window
-    k = p.shape[0]
-    n = window.shape[0] 
-
+    Parameters:
+    - x, y (int): coordinates of the reference patch's top-left corner
+    - image (np.ndarray): input image
+    - sigma (float): noise standard deviation
+    - patch_size (int): size of the patch
+    - window_size (int): size of the search window
+    - lambdaHard2d (float): thresholding parameter
+    - tauHard (float): similarity threshold
+    - N (int): max number of patches to keep
+    
+    Returns:
+    - closer_patches (np.ndarray): selected patches similar to the reference
+    - closer_coords (np.ndarray): coordinates of the selected patches
+    """
+    ref_patch = image[x:x+patch_size, y:y+patch_size]
+    ref_patch_array = ref_patch.reshape(-1, patch_size**2)
+    
+    search_window, x_win, y_win = get_search_window(image, x, y, patch_size, window_size)
+    window_patches = np.lib.stride_tricks.sliding_window_view(search_window, (patch_size, patch_size))
+    window_patches_array = window_patches.reshape(-1, patch_size**2)
+    
     if sigma > 40:
-        p = hard_thresholding(p, lambdaHard2d * sigma)
+        ref_patch_array = hard_thresholding(ref_patch_array, lambdaHard2d * sigma)
+        window_patches_array = hard_thresholding(window_patches_array, lambdaHard2d * sigma)
+
+    diff_squared = (ref_patch_array - window_patches_array) **2
+    ssd_array = np.sum(diff_squared, axis=1)
+    dist_array = ssd_array / (kHard ** 2)
     
-    for i in range(n-k+1):
-        for j in range(n-k+1):
-            # get patch Q and calculate distance to ref P
-            q = window[i:k+i, j:k+j]
-            if sigma > 40:
-                q = hard_thresholding(q, lambdaHard2d * sigma)
-            
-            dist = distance(p, q)
-            if dist <= tauHard:
-                dist_tuple = (-dist, (i, j))  # negate distance to use max-heap
-        
-                if len(closer_N_dists) < N: # because after we will take out the first one
-                    heapq.heappush(closer_N_dists, dist_tuple)
-                else:
-                    if dist_tuple > closer_N_dists[0]:
-                        heapq.heappushpop(closer_N_dists, dist_tuple)
-                        
-    closer_N_dists = [(-d, idx) for d, idx in closer_N_dists]
-    closer_N_dists = sorted(closer_N_dists, key=lambda x: x[0])
-
+    N = 2 ** (math.floor(math.log2(N)))
+    closer_indeces = dist_array.argsort()[:N]
+    closer_indeces = np.array([i for i in closer_indeces if dist_array[i] < tauHard])
     
-    group_3d = []
-    for _, (i, j) in closer_N_dists:
-        patch = window[i:k+i, j:k+j]
-        group_3d.append(patch)
-    group_3d=np.array(group_3d)
+    size = len(closer_indeces)
+    if not (size & (size-1) == 0):
+        new_size = 2 ** (math.floor(math.log2(size)))
+        closer_indeces = closer_indeces[:new_size]
     
-    return group_3d
+    closer_coords = np.array([[x_win+(i//(window_size - patch_size + 1)), y_win+(i%(window_size - patch_size + 1))] for i in closer_indeces])
+    closer_patches = np.array([window_patches_array[i].reshape(patch_size, patch_size) for i in closer_indeces])
 
-
-def grouping_1st_step(image, sigma, kHard, nHard, lambdaHard2d, tauHard, NHard):
-    height, width = image.shape
-    all_groups = []
-    
-
-    # iterate through patches in the image with a step
-    for x in range(0, height - kHard + 1, pHard):
-        for y in range(0, width - kHard + 1, pHard):
-
-            # grouping
-            patch = image[x:x+kHard, y:y+kHard]
-            search_window = get_search_window(image, x, y, patch_size=kHard, window_size=nHard)
-
-            group_3d = build_3d_group(patch, search_window, sigma, lambdaHard2d, tauHard, NHard)
-            N = len(group_3d)
-            if N > 0:
-                # check if its power of two
-                if not (N & (N - 1)) == 0:
-                    group_size = closest_power_of_two(N, NHard)
-                    group_3d = group_3d[:group_size]
-                all_groups.append((group_3d, (x, y)))
-
-    return all_groups
+    return closer_patches, closer_coords
 
 #%% COLLABORATIVE FILTERING
-#fast walsh-hadamard function
-def apply_1d_transform(x):
-    h = 1
-    while h < len(x):
-        for i in range(0, len(x), h * 2):
-            for j in range(h):
-                x[i + j], x[i + j + h] = x[i + j] + x[i + j + h], x[i + j] - x[i + j + h]
-        h *= 2
-    return x
-
-def reverse_1d_transform(x): #reverse walsh hadamard
+def walsh_hadamard_transform(x):
+    """ Applies the Walsh-Hadamard transform to a 1D array.
+    
+    Parameters:
+    - x (np.ndarray): 1D input array of length 2^n, where n is a non-negative integer.
+    
+    Returns:
+    - np.ndarray: transformed array
+    """
     n = len(x)
-    x = apply_1d_transform(x)
-    return x / n
+    if n & (n - 1) != 0:
+        raise ValueError("Length of input array must be a power of 2")
 
+    if n == 1:
+        return x
+    
+    even = walsh_hadamard_transform(x[0::2])
+    odd = walsh_hadamard_transform(x[1::2])
 
-def apply_2d_transform(patch, use_dct=False):
-    if use_dct:
-        return cv2.dct(patch)  # 2D DCT
-    else:
-        coeffs = pywt.wavedec2(patch, wavelet='bior1.5', level=2, mode='periodic')
-        return coeffs
-
-def reverse_2d_transform(patch, use_dct=False):
-    if use_dct:
-        return cv2.dct(patch, flags=cv2.DCT_INVERSE) #normalizacao ja foi feita
-    else:
-        coeffs = pywt.waverec2(patch, wavelet='bior1.5', level=2, mode='periodic')
-        return coeffs
-
-#%% 
-
-im = skio.imread('./lena.tif') # original image
-u = noise(im, sigma) # create noisy image
-
-grouping_list = grouping_1st_step(u, sigma, kHard, nHard, lambdaHard2d, tauHard, NHard)
-
-#%%
-
-## collaborative filtering tests
-group = grouping_list[0]
-
-print('\nLast patch from original group:\n')
-print(group[0][15])
-plt.imshow(group[0][15],cmap='gray')
-plt.title('Patch[15] from original group')
-plt.show()
-
-# t2d
-transformed = np.array([apply_2d_transform(patch, use_dct=True) for patch in group[0]]) #t2d
-
-#print(transformed[15])
-plt.imshow(transformed[15],cmap='gray')
-plt.title('Patch[15] after 2d DCT')
-plt.show()
-
-#t1d
-for i in range(transformed.shape[-2]):
-    for j in range(transformed.shape[-1]):
-        transformed[:, i, j] = apply_1d_transform(transformed[:, i, j]) #t1d
-
-#print(transformed[15])
-plt.imshow(transformed[15], cmap='gray')
-plt.title('Patch[15] after 2d DCT & 1D hadamard')
-plt.show()
-
-
-threshold = lambdaHard3d * sigma
-after = hard_thresholding(transformed, threshold)
-#after = transformed
-
-#print(after[15])
-plt.imshow(after[15], cmap='gray')
-plt.title('Patch[15] after T3D & hard threshold')
-plt.show()
-
-# reverse 1d
-for i in range(after.shape[-2]):
-    for j in range(after.shape[-1]):
-        after[:, i, j] = reverse_1d_transform(after[:, i, j]) #t1d
-
-#print(after[15])
-plt.imshow(after[15], cmap='gray')
-plt.title('Patch[15] after reverse 1D hadamard')
-plt.show()
-
-#reverse t2d
-final = np.array([reverse_2d_transform(patch, use_dct=True) for patch in after]) #t2d
-
-print('\nLast patch from final group:\n')
-print(final[15])
-plt.imshow(final[15], cmap='gray')
-plt.title('Patch[15] from final group (after reverse 3D)')
-plt.show()
-
-#%%
-'''
-here is python code that does this:
-1) Compute 8x8 matrices that, when applied to a vector result in a 1d Bior1.5 
-    trasnform
-2) A function that applies bior1.5 and inverse bior1.5 to any dimension of a 
-    tensor
-3) A test section that demonstrates that.
-
-To be clear the function get_Bior_matrices is called only once to 
-prepare your program. The function apply_bior is called whenever needed. 
-An example of 2D transform is also given.
-'''
-import numpy as np
-import pywt
+    return np.concatenate([even + odd, even - odd]) 
 
 def get_Bior_matrices(N=8):
-    directBior15_matrix=np.zeros((N,N))
-    ss=N//2
-    ls=[]
+    """ Computes Biorthogonal wavelet transform matrices.
+    
+    Parameters:
+    - N (int): size of the matrix
+    
+    Returns:
+    - directBior15_matrix, invBior15_matrix (np.ndarray): forward and inverse matrices
+    """
+    directBior15_matrix = np.zeros((N, N))
+    ss = N // 2
+    ls = []
 
-    while ss>0:
-        ls=ls+[ss]
-        ss=ss//2
-    print (ls)   
+    while ss > 0:
+        ls.append(ss)
+        ss = ss // 2
     for k in range(N):
-        inp=np.zeros(N)
-        inp[k]=1
-        tmp=inp
-        out=[]
+        inp = np.zeros(N)
+        inp[k] = 1
+        tmp = inp
+        out = []
         for s in ls:
-            #print (out,s)
-            (a,b)=pywt.dwt(tmp,'bior1.5',mode='periodic')
-            out=list(b[0:s])+out
-            tmp=a[:s]
-            #print ('sortie s=',s)
-        out=list(a[:s])+out
-        directBior15_matrix[k,:]=np.asarray(out)
+            (a, b) = pywt.dwt(tmp, 'bior1.5', mode='periodic')
+            out = list(b[0:s]) + out
+            tmp = a[:s]
+        out = list(a[:s]) + out
+        directBior15_matrix[k, :] = np.asarray(out)
 
-    invBior15_matrix=np.linalg.inv(directBior15_matrix)
-    return directBior15_matrix,invBior15_matrix
+    invBior15_matrix = np.linalg.inv(directBior15_matrix)
+    return directBior15_matrix, invBior15_matrix
 
-def apply_bior(V,M,dim):
-    s=V.shape
-    l=[0,1,2]
-    l[dim]=0
-    l[0]=dim
-    smod=list(s)
-    smod[dim]=s[0]
-    smod[0]=s[dim]
-    return (M@V.transpose(l).reshape(((M.shape[0]),-1))).reshape(smod).transpose(l)
+def apply_bior(V, M, dim):
+    """ Applies Biorthogonal transformation along a given dimension.
+    
+    Parameters:
+    - V (np.ndarray): input array
+    - M (np.ndarray): transformation matrix
+    - dim (int): dimension along which to apply the transformation
+    
+    Returns:
+    - np.ndarray: transformed array
+    """
+    s = V.shape
+    l = [0, 1, 2]
+    l[dim] = 0
+    l[0] = dim
+    smod = list(s)
+    smod[dim] = s[0]
+    smod[0] = s[dim]
+    return (M @ V.transpose(l).reshape((M.shape[0], -1))).reshape(smod).transpose(l)
 
+def apply_1d_transform(array, use_dct=False):
+    """ Applies a 1D transform (DCT or Walsh-Hadamard) to an array.
+    
+    Parameters:
+    - array (np.ndarray): input array
+    - use_dct (bool): whether to use DCT instead of Walsh-Hadamard
+    
+    Returns:
+    - np.ndarray: transformed array
+    """
+    return walsh_hadamard_transform(array) / np.sqrt(len(array))
 
-#%% TEST
-# The next line is done ONLY ONCE IN THE PROGRAM
-B8,IB8=get_Bior_matrices(N=8)
+B8, IB8 = get_Bior_matrices(N=kHard)
 
-v=np.random.randn(8,8,10)
+def apply_2d_transform(v, use_dct=False):
+    """ Applies a 2D transform (DCT or Biorthogonal wavelet) to an array.
+    
+    Parameters:
+    - v (np.ndarray): input array
+    - use_dct (bool): whether to use DCT
+    
+    Returns:
+    - np.ndarray: transformed array
+    """
+    if use_dct:
+        return cv2.dct(v)
+    else:
+        v1d = apply_bior(v, B8, -1)
+        v2d = apply_bior(v1d, B8, -2)
+        return v2d
 
-vapp=apply_bior(v,B8,1) #Apply direct bior to dimension 1
+def reverse_2d_transform(v, use_dct=False):
+    """ Reverses a 2D transform (DCT or Biorthogonal wavelet).
+    
+    Parameters:
+    - v (np.ndarray): input array
+    - use_dct (bool): whether to use DCT
+    
+    Returns:
+    - np.ndarray: inversely transformed array
+    """
+    if use_dct:
+        return cv2.dct(v, flags=cv2.DCT_INVERSE)
+    else:
+        vappinv1d = apply_bior(v, IB8, -1)
+        vappinv2d = apply_bior(vappinv1d, IB8, -2)
+        return vappinv2d
 
-print (vapp[6,:,7]-B8@v[6,:,7]) #check if the desired transform occured
+#%% AGGREGATION
+def update_aggregation_buffers(nu, delta, patches, coords, weights, X, Y):
+    """ Updates the aggregation buffers with weighted patches.
+    
+    Parameters:
+    - nu (np.ndarray): numerator aggregation buffer
+    - delta (np.ndarray): denominator aggregation buffer
+    - patches (np.ndarray): filtered patches
+    - coords (np.ndarray): coordinates of patches
+    - weights (np.ndarray): weights for each patch
+    - X, Y (np.ndarray): meshgrid arrays for patch positions
+    
+    Returns:
+    - nu, delta (np.ndarray): updated aggregation buffers
+    """
+    weights = weights.reshape(-1,1,1)
+    
+    # Offset the grid for each patch position
+    X_ = X + coords[:, 0].reshape(-1, 1, 1)  
+    Y_ = Y + coords[:, 1].reshape(-1, 1, 1)  
+    
+    np.add.at(nu, (X_, Y_), patches * weights)
+    np.add.at(delta, (X_, Y_), weights) 
+    
+    return nu, delta
 
-#check for inverse
+#%% 1ST STEP
+def bm3d_1st_step(image, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHard, NHard):
+    """ Executes the first step of the BM3D algorithm.
+    
+    Parameters:
+    - image (np.ndarray): noisy input image
+    - sigma (float): noise standard deviation
+    - kHard (int): patch size
+    - nHard (int): search window size
+    - lambdaHard2d, lambdaHard3d (float): thresholding parameters
+    - tauHard (float): similarity threshold
+    - NHard (int): max number of patches to keep
+    
+    Returns:
+    - basic (np.ndarray): denoised image after the first step
+    """
+    height, width = image.shape
 
-vappinv=apply_bior(vapp,IB8,1) # apply inverse bior to dimension 1
-print (((vappinv-v)**2).sum())
+    # pad image and iterate through original frame
+    window_size = nHard
+    offset = window_size // 2
+    padded_image = np.pad(image, offset, mode='reflect')
 
-# 2D bior transorf on dimensions 0 and 1. v is supposed size 8x8xN
-v1d=apply_bior(v,B8,1)
-v2d=apply_bior(v1d,B8,0) #see how
-#%%
-tmp=[0,0,1, 0,0,0,0,0]
-ls=[4,2,1]
-out=[]
-for s in ls:
-    #print (out,s)
-    (a,b)=pywt.dwt(tmp,'bior1.5',mode='periodic')
-    out=list(b[0:s])+out
-    tmp=a[:s]
+    nu = np.zeros(padded_image.shape)
+    delta = np.zeros(padded_image.shape)
+
+    X, Y = np.meshgrid(np.arange(kHard), np.arange(kHard), indexing='ij')
+    
+    # iterate through patches in the image with a step
+    for x in range(offset, offset + height - kHard + 1, pHard):
+        for y in range(offset , offset + width - kHard + 1, pHard):
+
+            # GROUPING
+            group3d, coords = grouping_1st_step(x, y, padded_image, sigma, patch_size=kHard, window_size=nHard, lambdaHard2d=lambdaHard2d, tauHard=tauHard, N=NHard)
+            if len(coords) < 1:
+                continue
+
+            # COLLABORATIVE FILTERING
+            # 3d transform
+            transformed = np.array(apply_2d_transform(group3d, use_dct=False))
+            transformed = apply_1d_transform(transformed) #t1d
+
+            # thresholding
+            threshold = lambdaHard3d * sigma
+            thresholded = hard_thresholding(transformed, threshold)
+
+            # calculate weights
+            NPHard = np.count_nonzero(thresholded)
+            weight = 1 / NPHard if NPHard >= 1 else 1
+            weight = np.array([weight])
+
+            # 3d reverse
+            thresholded = apply_1d_transform(thresholded) #t1d
+            filtered = np.array(reverse_2d_transform(thresholded, use_dct=False))
+
+            # AGGREGATION 
+            nu, delta = update_aggregation_buffers(nu, delta, filtered, coords, weight, X, Y)
+
+    # Compute the basic estimate by dividing aggregated values
+    basic = np.divide(nu[offset:offset+height, offset:offset+width], delta[offset:offset+height, offset:offset+width])
+
+    return basic
+
+#%% INITIALIZATION
+def noise(im, br):
+    """ Adds white Gaussian noise to the image with a specified standard deviation.
+    
+    Parameters:
+    - im (np.ndarray): original image
+    - br (float): standard deviation of noise
+    
+    Returns:
+    - np.ndarray: noisy image
+    """
+    imt = np.float32(im.copy())
+    bruit = br * np.random.randn(*imt.shape)
+    return imt + bruit
+
+# Read and display the images
+im = skio.imread('./lena.tif') # original image
+imbr = noise(im, sigma) # create noisy image
+
+# Display original, noisy, and denoised images
+print("Original Image:")
+plt.title("Original Image")
+plt.imshow(im, cmap='gray')
+plt.show()
+
+print("Image with noise:")
+plt.title("Image with noise")
+plt.imshow(imbr, cmap='gray')
+plt.show()
+
+basic_estimate = bm3d_1st_step(imbr, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHard, NHard)
+
+print("Basic estimate after 1st step:")
+plt.title("Basic estimate after 1st step")
+plt.imshow(basic_estimate, cmap='gray')
+plt.show()
