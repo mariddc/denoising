@@ -1,12 +1,13 @@
 #%% MODULES
 import numpy as np
 from skimage import io as skio
-import heapq
+from PIL import Image
 import pywt
 import math
 from scipy.linalg import hadamard
-import cv2
 import matplotlib.pyplot as plt
+from scipy.fftpack import dct, idct
+import time
 
 #%% PARAMETERS
 # Define parameters for the first step of the BM3D algorithm
@@ -17,11 +18,19 @@ nHard = 39 # Search window size
 NHard = 16 # Max number of similar patches kept
 pHard = 3
 
-sigma = 30
+sigma = 50
 tauHard = 5000 if sigma > 40 else 2500
 
 lambdaHard2d = 0  # Thresholding parameter for grouping
 lambdaHard3d = 2.7
+
+# 2nd step
+kWien = 8
+nWien = 39
+NWien = 32
+pWien = 3
+
+tauWien = 3500 if sigma > 40 else 400
 
 #%% GROUPING 1ST STEP
 def get_search_window(image, x, y, patch_size=kHard, window_size=nHard):
@@ -37,8 +46,8 @@ def get_search_window(image, x, y, patch_size=kHard, window_size=nHard):
     - search_window (np.ndarray): search window around the reference patch
     - window_top_left_x, window_top_left_y (int): coordinates of the top-left corner of the search window
     """
-    window_top_left_x = x - (window_size // 2 - patch_size // 2)
-    window_top_left_y = y - (window_size // 2 - patch_size // 2)
+    window_top_left_x = x - (window_size//2 - patch_size//2)
+    window_top_left_y = y - (window_size//2 - patch_size//2)
     
     search_window = image[
         window_top_left_x: window_top_left_x + window_size,
@@ -75,30 +84,36 @@ def grouping_1st_step(x, y, image, sigma, patch_size, window_size, lambdaHard2d,
     - closer_patches (np.ndarray): selected patches similar to the reference
     - closer_coords (np.ndarray): coordinates of the selected patches
     """
+    # reference patch as array
     ref_patch = image[x:x+patch_size, y:y+patch_size]
     ref_patch_array = ref_patch.reshape(-1, patch_size**2)
     
+    # vectorized patches from search window
     search_window, x_win, y_win = get_search_window(image, x, y, patch_size, window_size)
     window_patches = np.lib.stride_tricks.sliding_window_view(search_window, (patch_size, patch_size))
     window_patches_array = window_patches.reshape(-1, patch_size**2)
     
+    # hard thresholding
     if sigma > 40:
         ref_patch_array = hard_thresholding(ref_patch_array, lambdaHard2d * sigma)
         window_patches_array = hard_thresholding(window_patches_array, lambdaHard2d * sigma)
 
+    # calculate vector differences to reference patch
     diff_squared = (ref_patch_array - window_patches_array) **2
     ssd_array = np.sum(diff_squared, axis=1)
     dist_array = ssd_array / (kHard ** 2)
     
+    # get N closest patches, N must be power of 2 and distance must be < tauHard
     N = 2 ** (math.floor(math.log2(N)))
     closer_indeces = dist_array.argsort()[:N]
-    closer_indeces = np.array([i for i in closer_indeces if dist_array[i] < tauHard])
+    closer_indeces = np.array([i for i in closer_indeces if dist_array[i] < tauHard]) #apply similarity threshold
     
     size = len(closer_indeces)
     if not (size & (size-1) == 0):
         new_size = 2 ** (math.floor(math.log2(size)))
         closer_indeces = closer_indeces[:new_size]
     
+    # get top left coord of each patch and build the 3d group
     closer_coords = np.array([[x_win+(i//(window_size - patch_size + 1)), y_win+(i%(window_size - patch_size + 1))] for i in closer_indeces])
     closer_patches = np.array([window_patches_array[i].reshape(patch_size, patch_size) for i in closer_indeces])
 
@@ -189,40 +204,66 @@ def apply_1d_transform(array, use_dct=False):
     """
     return walsh_hadamard_transform(array) / np.sqrt(len(array))
 
-B8, IB8 = get_Bior_matrices(N=kHard)
 
-def apply_2d_transform(v, use_dct=False):
-    """ Applies a 2D transform (DCT or Biorthogonal wavelet) to an array.
-    
+def dct2d(block):
+    """Performs a 2D Discrete Cosine Transform (DCT) on a block.
+    Applies the DCT first along rows (axis=0), then along columns (axis=1).
+    The 'ortho' normalization ensures energy conservation during the transform.
+
     Parameters:
-    - v (np.ndarray): input array
-    - use_dct (bool): whether to use DCT
+    - block (np.ndarray): The 2D input array (e.g., an 8x8 block).
     
     Returns:
-    - np.ndarray: transformed array
+    - np.ndarray: The 2D DCT-transformed array.
+    """
+    return dct(dct(block, axis=0, norm='ortho'), axis=1, norm='ortho')
+
+def idct2d(block):
+    """Performs a 2D Inverse Discrete Cosine Transform (IDCT) on a block.
+    Applies the DCT first along rows (axis=1), then along columns (axis=0).
+    The 'ortho' normalization ensures energy conservation during the inverse transform.
+    
+    Parameters:
+    - block (np.ndarray): The 2D DCT-transformed input array.
+    
+    Returns:
+    - np.ndarray: The reconstructed 2D array after applying the inverse DCT.
+    """
+    return idct(idct(block, axis=1, norm='ortho'), axis=0, norm='ortho')
+
+B8, IB8 = get_Bior_matrices(N=kHard)
+def apply_2d_transform(v, use_dct=False):
+    """Applies a 2D transform (either DCT or Biorthogonal) on a set of blocks or coefficients.
+    
+    Parameters:
+    - v (np.ndarray): A collection of 2D arrays (blocks).
+    - use_dct (bool): If True, use the DCT-based 2D transform. Otherwise, use the Biorthogonal transform.
+    
+    Returns:
+    - list or np.ndarray: The transformed data.
     """
     if use_dct:
-        return cv2.dct(v)
+        return [dct2d(block) for block in v]
     else:
-        v1d = apply_bior(v, B8, -1)
-        v2d = apply_bior(v1d, B8, -2)
+        v1d=apply_bior(v,B8,-1)
+        v2d=apply_bior(v1d,B8,-2)
         return v2d
 
 def reverse_2d_transform(v, use_dct=False):
-    """ Reverses a 2D transform (DCT or Biorthogonal wavelet).
+    """Reverses a 2D transform (either DCT or Biorthogonal) on a set of blocks or coefficients.
     
     Parameters:
-    - v (np.ndarray): input array
-    - use_dct (bool): whether to use DCT
+    - v (np.ndarray): A collection of 2D transformed blocks or coefficients.
+    - use_dct (bool): If True, use the DCT-based 2D inverse transform. Otherwise, use the inverse Biorthogonal transform.
     
     Returns:
-    - np.ndarray: inversely transformed array
+    - list or numpy.ndarray: The reconstructed (inverse-transformed) data.
     """
     if use_dct:
-        return cv2.dct(v, flags=cv2.DCT_INVERSE)
+        return [idct2d(block) for block in v]
     else:
-        vappinv1d = apply_bior(v, IB8, -1)
-        vappinv2d = apply_bior(vappinv1d, IB8, -2)
+        vappinv1d=apply_bior(v,IB8,-1)
+        vappinv2d=apply_bior(vappinv1d,IB8,-2)
         return vappinv2d
 
 #%% AGGREGATION
@@ -313,6 +354,112 @@ def bm3d_1st_step(image, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHar
     basic = np.divide(nu[offset:offset+height, offset:offset+width], delta[offset:offset+height, offset:offset+width])
 
     return basic
+#%% SECOND STEP
+def grouping_2nd_step(x, y, image, basic, sigma, patch_size, window_size, lambdaHard2d, tauWien, NWien):
+    #group formed by the basic estimate
+    basic_patches, basic_coords = grouping_1st_step(x, y, basic, sigma, patch_size, window_size, lambdaHard2d, tauWien, NWien)
+
+    #group formed by the original image
+    original_patches = np.array([image[i:i+patch_size, j:j+patch_size] for i,j in basic_coords])
+
+    return original_patches, basic_patches, basic_coords
+
+def bm3d_2nd_step(image, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lambdaHard3d, tauWien, NWien):
+    height, width = image.shape
+
+    # pad image and iterate through original frame
+    window_size = nWien
+    offset = window_size // 2
+    padded_image = np.pad(image, offset, mode='reflect')
+    padded_basic = np.pad(basic_estimate, offset, mode='reflect')
+
+    nu = np.zeros(padded_image.shape)
+    delta = np.zeros(padded_image.shape)
+
+    X, Y = np.meshgrid(np.arange(kWien), np.arange(kWien), indexing='ij')
+    
+    # iterate through patches in the image with a step
+    for x in range(offset, offset + height - kWien + 1, pWien):
+        for y in range(offset , offset + width - kWien + 1, pWien):
+
+            # GROUPING
+            group3d_original, group3d_basic, coords = grouping_2nd_step(x, y, padded_image, padded_basic, sigma, patch_size=kWien, window_size=nWien, lambdaHard2d=lambdaHard2d, tauWien=tauWien, NWien=NWien)
+            if len(coords) < 1:
+                continue
+
+            # COLLABORATIVE FILTERING
+            # basic 3D transform
+            basic_transformed = np.array(apply_2d_transform(group3d_basic, use_dct=True))
+            basic_transformed = apply_1d_transform(basic_transformed) 
+
+            # wiener coefficients over basic
+            module = np.absolute(basic_transformed) ** 2
+            wp = module / (module + sigma**2) 
+
+            # original 3D transform
+            original_transformed = np.array(apply_2d_transform(group3d_original, use_dct=True))
+            original_transformed = apply_1d_transform(original_transformed) 
+
+            # wiener filtering over original
+            original_filtered = wp * original_transformed
+
+            # 3D reverse
+            filtered = apply_1d_transform(original_filtered)
+            filtered = np.array(reverse_2d_transform(filtered, use_dct=True))
+
+            # calculate weights
+            weight = np.array([np.linalg.norm(wp) ** (-2)])
+
+            # AGGREGATION 
+            nu, delta = update_aggregation_buffers(nu, delta, filtered, coords, weight, X, Y)
+
+    ## FINAL ESTIMATE
+    final = np.divide(nu[offset:offset+height, offset:offset+width], delta[offset:offset+height, offset:offset+width])
+
+    return final
+
+#%% EVALUATION
+def compute_rmse(reference_image, denoised_image):
+    """
+    Compute the Root Mean Square Error (RMSE) between two images.
+    
+    Parameters:
+        reference_image (numpy.ndarray): The noiseless reference image (u_R).
+        denoised_image (numpy.ndarray): The denoised image (u_D).
+        
+    Returns:
+        float: The RMSE value.
+    """ 
+    # Compute RMSE using vectorized operations
+    mse = np.mean((reference_image - denoised_image) ** 2)
+    if mse == 0:
+        return float('inf')  # PSNR is infinite if the images are identical
+    rmse = np.sqrt(mse)
+    
+    return rmse
+
+def compute_psnr(reference_image, denoised_image):
+    """
+    Compute the Peak Signal-to-Noise Ratio (PSNR) between two images.
+    
+    Parameters:
+        reference_image (numpy.ndarray): The noiseless reference image.
+        denoised_image (numpy.ndarray): The denoised image.
+        
+    Returns:
+        float: The PSNR value in decibels (dB).
+    """
+    # Ensure the two images have the same shape
+    assert reference_image.shape == denoised_image.shape, "Images must have the same dimensions"
+    
+    # Compute RMSE
+    rmse = compute_rmse(reference_image, denoised_image)
+    
+    # Compute PSNR
+    max_pixel_value = 255.0  # Assuming 8-bit images with pixel values in [0, 255]
+    psnr = 20 * np.log10(max_pixel_value / rmse)
+    
+    return psnr
 
 #%% INITIALIZATION
 def noise(im, br):
@@ -329,24 +476,52 @@ def noise(im, br):
     bruit = br * np.random.randn(*imt.shape)
     return imt + bruit
 
-# Read and display the images
-im = skio.imread('./lena.tif') # original image
+def normalize (image, vmin=0, vmax=255):
+    image = (image - image.min()) / (image.max() - image.min()) * vmax
+    image = np.clip(image, vmin, vmax).astype(np.float32)
+    return image
+
+#%% PLOT RESULTS
+def plot_results(original, noisy, basic, final, sigma, psnr1, psnr2, ex_time, figsize=(10, 8)):
+    images = [original, noisy, basic, final]
+    titles = ['Original image', 'Noisy image (std dev = '+str(sigma)+')', 'Basic estimate (1st step)', 'Final estimate(2nd step)']
+    subtitles = ['PSNR: '+ str(psnr1), 'PSNR: '+str(psnr2)]
+    note = 'Execution time: '+ str(ex_time)+ 's'
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    axes = axes.flatten()
+    for i, ax in enumerate(axes):
+        ax.imshow(images[i], cmap='gray', vmin=0, vmax=255)  
+        ax.set_title(titles[i], fontsize=12, pad=10) 
+        ax.axis('off') 
+        if i >= 2: 
+            ax.text(
+                0.5, -0.05, subtitles[i - 2],  
+                ha='center', va='center', transform=ax.transAxes, fontsize=10, color='black'
+            )
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.2) 
+    fig.text(0.95, 0.03, note, ha='right', fontsize=8, color='blue')
+    plt.show()
+
+#%% MAIN
+
+start = time.time()
+
+im = skio.imread('./muro.tif', as_gray=True) # original image
+im = normalize(im)
 imbr = noise(im, sigma) # create noisy image
-
-# Display original, noisy, and denoised images
-print("Original Image:")
-plt.title("Original Image")
-plt.imshow(im, cmap='gray')
-plt.show()
-
-print("Image with noise:")
-plt.title("Image with noise")
-plt.imshow(imbr, cmap='gray')
-plt.show()
-
 basic_estimate = bm3d_1st_step(imbr, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHard, NHard)
+final_estimate = bm3d_2nd_step(imbr, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lambdaHard3d, tauWien, NWien)
 
-print("Basic estimate after 1st step:")
-plt.title("Basic estimate after 1st step")
-plt.imshow(basic_estimate, cmap='gray')
-plt.show()
+basic_psnr = compute_psnr(im, basic_estimate)
+final_psnr = compute_psnr(im, final_estimate)
+
+end = time.time()
+
+exec_time = end - start
+print(exec_time)
+#%%
+plot_results(original=im, noisy=imbr, basic=basic_estimate, final=final_estimate, sigma=sigma, psnr1=basic_psnr, psnr2=final_psnr, ex_time=exec_time)
+
+# %%
