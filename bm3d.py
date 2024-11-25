@@ -1,26 +1,17 @@
 #%% MODULES
 import numpy as np
 from skimage import io as skio
-from PIL import Image
 import pywt
-import math
-from scipy.linalg import hadamard
 import matplotlib.pyplot as plt
 from scipy.fftpack import dct, idct
-import time
+import math, time, os
 
 #%% PARAMETERS
-# Define parameters for the first step of the BM3D algorithm
-
 # 1st step
 kHard = 8  # Patch size
 nHard = 39 # Search window size
 NHard = 16 # Max number of similar patches kept
 pHard = 3
-
-sigma = 50
-tauHard = 5000 if sigma > 40 else 2500
-
 lambdaHard2d = 0  # Thresholding parameter for grouping
 lambdaHard3d = 2.7
 
@@ -30,7 +21,11 @@ nWien = 39
 NWien = 32
 pWien = 3
 
-tauWien = 3500 if sigma > 40 else 400
+
+def define_thresholds(sigma):
+    tauHard = 5000 if sigma > 40 else 2500
+    tauWien = 3500 if sigma > 40 else 400
+    return tauHard, tauWien
 
 #%% GROUPING 1ST STEP
 def get_search_window(image, x, y, patch_size=kHard, window_size=nHard):
@@ -192,58 +187,30 @@ def apply_bior(V, M, dim):
     smod[0] = s[dim]
     return (M @ V.transpose(l).reshape((M.shape[0], -1))).reshape(smod).transpose(l)
 
-def apply_1d_transform(array, use_dct=False):
-    """ Applies a 1D transform (DCT or Walsh-Hadamard) to an array.
+def apply_1d_transform(array):
+    """ Applies a 1D transform (Walsh-Hadamard) to an array.
     
     Parameters:
     - array (np.ndarray): input array
-    - use_dct (bool): whether to use DCT instead of Walsh-Hadamard
     
     Returns:
-    - np.ndarray: transformed array
+    - np.ndarray: transformed array normalized
     """
     return walsh_hadamard_transform(array) / np.sqrt(len(array))
-
-
-def dct2d(block):
-    """Performs a 2D Discrete Cosine Transform (DCT) on a block.
-    Applies the DCT first along rows (axis=0), then along columns (axis=1).
-    The 'ortho' normalization ensures energy conservation during the transform.
-
-    Parameters:
-    - block (np.ndarray): The 2D input array (e.g., an 8x8 block).
-    
-    Returns:
-    - np.ndarray: The 2D DCT-transformed array.
-    """
-    return dct(dct(block, axis=0, norm='ortho'), axis=1, norm='ortho')
-
-def idct2d(block):
-    """Performs a 2D Inverse Discrete Cosine Transform (IDCT) on a block.
-    Applies the DCT first along rows (axis=1), then along columns (axis=0).
-    The 'ortho' normalization ensures energy conservation during the inverse transform.
-    
-    Parameters:
-    - block (np.ndarray): The 2D DCT-transformed input array.
-    
-    Returns:
-    - np.ndarray: The reconstructed 2D array after applying the inverse DCT.
-    """
-    return idct(idct(block, axis=1, norm='ortho'), axis=0, norm='ortho')
 
 B8, IB8 = get_Bior_matrices(N=kHard)
 def apply_2d_transform(v, use_dct=False):
     """Applies a 2D transform (either DCT or Biorthogonal) on a set of blocks or coefficients.
     
     Parameters:
-    - v (np.ndarray): A collection of 2D arrays (blocks).
+    - v (np.ndarray): A collection of 2D arrays (3d group).
     - use_dct (bool): If True, use the DCT-based 2D transform. Otherwise, use the Biorthogonal transform.
     
     Returns:
-    - list or np.ndarray: The transformed data.
+    - np.ndarray: The transformed data.
     """
     if use_dct:
-        return [dct2d(block) for block in v]
+        return dct(dct(v, axis=1, norm='ortho'), axis=2, norm='ortho')
     else:
         v1d=apply_bior(v,B8,-1)
         v2d=apply_bior(v1d,B8,-2)
@@ -253,14 +220,14 @@ def reverse_2d_transform(v, use_dct=False):
     """Reverses a 2D transform (either DCT or Biorthogonal) on a set of blocks or coefficients.
     
     Parameters:
-    - v (np.ndarray): A collection of 2D transformed blocks or coefficients.
+    - v (np.ndarray): A collection of 2D transformed blocks.
     - use_dct (bool): If True, use the DCT-based 2D inverse transform. Otherwise, use the inverse Biorthogonal transform.
     
     Returns:
-    - list or numpy.ndarray: The reconstructed (inverse-transformed) data.
+    - numpy.ndarray: The reconstructed (inverse-transformed) data.
     """
     if use_dct:
-        return [idct2d(block) for block in v]
+        return idct(idct(v, axis=2, norm='ortho'), axis=1, norm='ortho') 
     else:
         vappinv1d=apply_bior(v,IB8,-1)
         vappinv2d=apply_bior(vappinv1d,IB8,-2)
@@ -321,8 +288,8 @@ def bm3d_1st_step(image, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHar
     X, Y = np.meshgrid(np.arange(kHard), np.arange(kHard), indexing='ij')
     
     # iterate through patches in the image with a step
-    for x in range(offset, offset + height - kHard + 1, pHard):
-        for y in range(offset , offset + width - kHard + 1, pHard):
+    for x in range(offset, offset + height - kHard + pHard, pHard):
+        for y in range(offset , offset + width - kHard + pHard, pHard):
 
             # GROUPING
             group3d, coords = grouping_1st_step(x, y, padded_image, sigma, patch_size=kHard, window_size=nHard, lambdaHard2d=lambdaHard2d, tauHard=tauHard, N=NHard)
@@ -356,6 +323,16 @@ def bm3d_1st_step(image, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHar
     return basic
 #%% SECOND STEP
 def grouping_2nd_step(x, y, image, basic, sigma, patch_size, window_size, lambdaHard2d, tauWien, NWien):
+    """
+    Forms groups of patches for the second step of the BM3D algorithm.
+
+    - x, y (int): Coordinates of the top-left corner of the reference patch.
+
+    Returns:
+    - original_patches (np.ndarray): 3D array of patches grouped from the original noisy image.
+    - basic_patches (np.ndarray): 3D array of patches grouped from the basic estimate.
+    - basic_coords (list of tuples): List of coordinates of the grouped patches.
+    """
     #group formed by the basic estimate
     basic_patches, basic_coords = grouping_1st_step(x, y, basic, sigma, patch_size, window_size, lambdaHard2d, tauWien, NWien)
 
@@ -365,6 +342,23 @@ def grouping_2nd_step(x, y, image, basic, sigma, patch_size, window_size, lambda
     return original_patches, basic_patches, basic_coords
 
 def bm3d_2nd_step(image, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lambdaHard3d, tauWien, NWien):
+    """
+    Executes the second step of the BM3D algorithm.
+
+    Parameters:
+    - image (np.ndarray): Original noisy input image.
+    - basic_estimate (np.ndarray): Basic estimate of the denoised image from the first step.
+    - sigma (float): Noise standard deviation.
+    - kWien (int): Patch size.
+    - nWien (int): Search window size.
+    - lambdaHard2d (float): Thresholding parameter for patch similarity.
+    - lambdaHard3d (float): Thresholding parameter for 3D filtering.
+    - tauWien (float): Similarity threshold for Wiener grouping.
+    - NWien (int): Maximum number of patches to group.
+
+    Returns:
+    - final (np.ndarray): Final denoised image after the second step.
+    """
     height, width = image.shape
 
     # pad image and iterate through original frame
@@ -379,8 +373,8 @@ def bm3d_2nd_step(image, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lamb
     X, Y = np.meshgrid(np.arange(kWien), np.arange(kWien), indexing='ij')
     
     # iterate through patches in the image with a step
-    for x in range(offset, offset + height - kWien + 1, pWien):
-        for y in range(offset , offset + width - kWien + 1, pWien):
+    for x in range(offset, offset + height - kWien + pWien, pWien):
+        for y in range(offset , offset + width - kWien + pWien, pWien):
 
             # GROUPING
             group3d_original, group3d_basic, coords = grouping_2nd_step(x, y, padded_image, padded_basic, sigma, patch_size=kWien, window_size=nWien, lambdaHard2d=lambdaHard2d, tauWien=tauWien, NWien=NWien)
@@ -392,7 +386,7 @@ def bm3d_2nd_step(image, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lamb
             basic_transformed = np.array(apply_2d_transform(group3d_basic, use_dct=True))
             basic_transformed = apply_1d_transform(basic_transformed) 
 
-            # wiener coefficients over basic
+            # wiener coefficients over basic estimation
             module = np.absolute(basic_transformed) ** 2
             wp = module / (module + sigma**2) 
 
@@ -417,6 +411,7 @@ def bm3d_2nd_step(image, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lamb
     final = np.divide(nu[offset:offset+height, offset:offset+width], delta[offset:offset+height, offset:offset+width])
 
     return final
+
 
 #%% EVALUATION
 def compute_rmse(reference_image, denoised_image):
@@ -452,11 +447,8 @@ def compute_psnr(reference_image, denoised_image):
     # Ensure the two images have the same shape
     assert reference_image.shape == denoised_image.shape, "Images must have the same dimensions"
     
-    # Compute RMSE
     rmse = compute_rmse(reference_image, denoised_image)
-    
-    # Compute PSNR
-    max_pixel_value = 255.0  # Assuming 8-bit images with pixel values in [0, 255]
+    max_pixel_value = 255.0  # 8-bit images with pixel values in [0, 255]
     psnr = 20 * np.log10(max_pixel_value / rmse)
     
     return psnr
@@ -474,9 +466,13 @@ def noise(im, br):
     """
     imt = np.float32(im.copy())
     bruit = br * np.random.randn(*imt.shape)
-    return imt + bruit
+    imt += bruit
+    return imt
 
 def normalize (image, vmin=0, vmax=255):
+    """
+    Normalizes image values to a specified range
+    """
     image = (image - image.min()) / (image.max() - image.min()) * vmax
     image = np.clip(image, vmin, vmax).astype(np.float32)
     return image
@@ -484,14 +480,14 @@ def normalize (image, vmin=0, vmax=255):
 #%% PLOT RESULTS
 def plot_results(original, noisy, basic, final, sigma, psnr1, psnr2, ex_time, figsize=(10, 8)):
     images = [original, noisy, basic, final]
-    titles = ['Original image', 'Noisy image (std dev = '+str(sigma)+')', 'Basic estimate (1st step)', 'Final estimate(2nd step)']
-    subtitles = ['PSNR: '+ str(psnr1), 'PSNR: '+str(psnr2)]
-    note = 'Execution time: '+ str(ex_time)+ 's'
+    titles = ['Original image', f'Noisy image (std dev = {sigma})', 'Basic estimate (1st step)', 'Final estimate(2nd step)']
+    subtitles = [f'PSNR: {psnr1:.2f}', f'PSNR: {psnr2:.2f}']
+    note = f'Execution time: {ex_time:.2f}s'
 
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     axes = axes.flatten()
     for i, ax in enumerate(axes):
-        ax.imshow(images[i], cmap='gray', vmin=0, vmax=255)  
+        ax.imshow(images[i], cmap='gray') 
         ax.set_title(titles[i], fontsize=12, pad=10) 
         ax.axis('off') 
         if i >= 2: 
@@ -501,27 +497,84 @@ def plot_results(original, noisy, basic, final, sigma, psnr1, psnr2, ex_time, fi
             )
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.2) 
-    fig.text(0.95, 0.03, note, ha='right', fontsize=8, color='blue')
+    fig.text(0.95, 0.03, note, ha='right', fontsize=8)
+    return fig
+
+#%% EXAMPLE OF USAGE
+
+def run_bm3d(noisy_image, sigma):
+    """Runs the full BM3D denoising algorithm
+    Parameters:
+    - Noisy image (np.ndarray): image to be denoised
+    - Sigma (int): standard deviation of the gaussian noise applied
+    Returns:
+    - final_estimate (np.ndarray): denoised image
+    """
+    tauHard, tauWien = define_thresholds(sigma)
+    basic_estimate = bm3d_1st_step(imbr, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHard, NHard)
+    final_estimate = bm3d_2nd_step(imbr, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lambdaHard3d, tauWien, NWien)
+
+    return final_estimate
+
+def run_bm3d_and_save(image_file, original_image, noisy_image, sigma):
+    tauHard, tauWien = define_thresholds(sigma)
+
+    #prepare
+    im = original_image
+    imbr = noisy_image
+    
+    #denoise
+    start = time.time()
+    basic_estimate = bm3d_1st_step(imbr, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHard, NHard)
+    final_estimate = bm3d_2nd_step(imbr, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lambdaHard3d, tauWien, NWien)
+    end = time.time()
+
+    #evaluate
+    basic_psnr = compute_psnr(im, basic_estimate)
+    final_psnr = compute_psnr(im, final_estimate)
+    exec_time = end - start
+    #print(exec_time)
+    
+    basic_estimate = np.clip(basic_estimate, a_min=0.0, a_max=255.0)
+    final_estimate = np.clip(final_estimate, a_min=0.0, a_max=255.0)
+    imbr = np.clip(imbr, a_min=0.0, a_max=255.0)
+    
+    #plot
+    fig = plot_results(original=im, noisy=imbr, basic=basic_estimate, final=final_estimate, sigma=sigma, psnr1=basic_psnr, psnr2=final_psnr, ex_time=exec_time)
+    
+    image_name, _ = os.path.splitext(image_file)
+    plt.savefig(f'./bm3d-results-plt/{image_name}s{sigma}-plot.png', dpi=300, bbox_inches='tight')
+    plt.imsave(f'./bm3d-results/{image_name}s{sigma}-noisy.jpg', imbr, cmap='gray') 
+    plt.imsave(f'./bm3d-results/{image_name}s{sigma}-basic.jpg', basic_estimate, cmap='gray') 
+    plt.imsave(f'./bm3d-results/{image_name}s{sigma}-denoised.jpg', final_estimate, cmap='gray') 
+    plt.close()
+
+    return final_estimate, final_psnr
+
+
+
+if __name__ == '__main__':
+    # inputs
+    image_file = 'lena.tif'
+    sigma = 30
+
+    im = skio.imread(f'./images/{image_file}', as_gray=True) 
+    im = normalize(im)
+    imbr = noise(im, sigma) # create noisy image
+
+    start = time.time()
+    denoised = run_bm3d(imbr, sigma)
+    end = time.time()
+
+    print(f'PSNR: {compute_psnr(im, denoised):.2f}')
+
+    print(f'Execution time: {end - start: .2f}s')
+    
+    denoised = np.clip(denoised, a_min=0.0, a_max=255.0)
+    plt.imshow(denoised, cmap='gray')
     plt.show()
 
-#%% MAIN
+    #run_bm3d_and_save(image_file, im, imbr, sigma)
 
-start = time.time()
 
-im = skio.imread('./muro.tif', as_gray=True) # original image
-im = normalize(im)
-imbr = noise(im, sigma) # create noisy image
-basic_estimate = bm3d_1st_step(imbr, sigma, kHard, nHard, lambdaHard2d, lambdaHard3d, tauHard, NHard)
-final_estimate = bm3d_2nd_step(imbr, basic_estimate, sigma, kWien, nWien, lambdaHard2d, lambdaHard3d, tauWien, NWien)
 
-basic_psnr = compute_psnr(im, basic_estimate)
-final_psnr = compute_psnr(im, final_estimate)
-
-end = time.time()
-
-exec_time = end - start
-print(exec_time)
-#%%
-plot_results(original=im, noisy=imbr, basic=basic_estimate, final=final_estimate, sigma=sigma, psnr1=basic_psnr, psnr2=final_psnr, ex_time=exec_time)
-
-# %%
