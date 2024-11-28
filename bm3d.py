@@ -1,6 +1,5 @@
 #%% MODULES
 import numpy as np
-from skimage import io as skio
 import pywt
 import matplotlib.pyplot as plt
 from scipy.fftpack import dct, idct
